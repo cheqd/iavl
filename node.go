@@ -6,29 +6,29 @@ package iavl
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 
 	"github.com/cosmos/iavl/cache"
-	"github.com/pkg/errors"
 
 	"github.com/cosmos/iavl/internal/encoding"
 )
 
 // Node represents a node in a Tree.
 type Node struct {
-	key       []byte
-	value     []byte
-	hash      []byte
-	leftHash  []byte
-	rightHash []byte
-	version   int64
-	size      int64
-	leftNode  *Node
-	rightNode *Node
-	height    int8
-	persisted bool
+	key           []byte
+	value         []byte
+	hash          []byte
+	leftHash      []byte
+	rightHash     []byte
+	version       int64
+	size          int64
+	leftNode      *Node
+	rightNode     *Node
+	subtreeHeight int8
+	persisted     bool
 }
 
 var _ cache.Node = (*Node)(nil)
@@ -36,11 +36,11 @@ var _ cache.Node = (*Node)(nil)
 // NewNode returns a new node from a key, value and version.
 func NewNode(key []byte, value []byte, version int64) *Node {
 	return &Node{
-		key:     key,
-		value:   value,
-		height:  0,
-		size:    1,
-		version: version,
+		key:           key,
+		value:         value,
+		subtreeHeight: 0,
+		size:          1,
+		version:       version,
 	}
 }
 
@@ -49,11 +49,10 @@ func NewNode(key []byte, value []byte, version int64) *Node {
 // The new node doesn't have its hash saved or set. The caller must set it
 // afterwards.
 func MakeNode(buf []byte) (*Node, error) {
-
 	// Read node header (height, size, version, key).
 	height, n, cause := encoding.DecodeVarint(buf)
 	if cause != nil {
-		return nil, errors.Wrap(cause, "decoding node.height")
+		return nil, fmt.Errorf("decoding node.height, %w", cause)
 	}
 	buf = buf[n:]
 	if height < int64(math.MinInt8) || height > int64(math.MaxInt8) {
@@ -62,27 +61,27 @@ func MakeNode(buf []byte) (*Node, error) {
 
 	size, n, cause := encoding.DecodeVarint(buf)
 	if cause != nil {
-		return nil, errors.Wrap(cause, "decoding node.size")
+		return nil, fmt.Errorf("decoding node.size, %w", cause)
 	}
 	buf = buf[n:]
 
 	ver, n, cause := encoding.DecodeVarint(buf)
 	if cause != nil {
-		return nil, errors.Wrap(cause, "decoding node.version")
+		return nil, fmt.Errorf("decoding node.version, %w", cause)
 	}
 	buf = buf[n:]
 
 	key, n, cause := encoding.DecodeBytes(buf)
 	if cause != nil {
-		return nil, errors.Wrap(cause, "decoding node.key")
+		return nil, fmt.Errorf("decoding node.key, %w", cause)
 	}
 	buf = buf[n:]
 
 	node := &Node{
-		height:  int8(height),
-		size:    size,
-		version: ver,
-		key:     key,
+		subtreeHeight: int8(height),
+		size:          size,
+		version:       ver,
+		key:           key,
 	}
 
 	// Read node body.
@@ -90,19 +89,19 @@ func MakeNode(buf []byte) (*Node, error) {
 	if node.isLeaf() {
 		val, _, cause := encoding.DecodeBytes(buf)
 		if cause != nil {
-			return nil, errors.Wrap(cause, "decoding node.value")
+			return nil, fmt.Errorf("decoding node.value, %w", cause)
 		}
 		node.value = val
 	} else { // Read children.
 		leftHash, n, cause := encoding.DecodeBytes(buf)
 		if cause != nil {
-			return nil, errors.Wrap(cause, "deocding node.leftHash")
+			return nil, fmt.Errorf("deocding node.leftHash, %w", cause)
 		}
 		buf = buf[n:]
 
 		rightHash, _, cause := encoding.DecodeBytes(buf)
 		if cause != nil {
-			return nil, errors.Wrap(cause, "decoding node.rightHash")
+			return nil, fmt.Errorf("decoding node.rightHash, %w", cause)
 		}
 		node.leftHash = leftHash
 		node.rightHash = rightHash
@@ -110,8 +109,8 @@ func MakeNode(buf []byte) (*Node, error) {
 	return node, nil
 }
 
-func (n *Node) GetKey() []byte {
-	return n.hash
+func (node *Node) GetKey() []byte {
+	return node.hash
 }
 
 // String returns a string representation of the node.
@@ -134,21 +133,21 @@ func (node *Node) clone(version int64) (*Node, error) {
 		return nil, ErrCloneLeafNode
 	}
 	return &Node{
-		key:       node.key,
-		height:    node.height,
-		version:   version,
-		size:      node.size,
-		hash:      nil,
-		leftHash:  node.leftHash,
-		leftNode:  node.leftNode,
-		rightHash: node.rightHash,
-		rightNode: node.rightNode,
-		persisted: false,
+		key:           node.key,
+		subtreeHeight: node.subtreeHeight,
+		version:       version,
+		size:          node.size,
+		hash:          nil,
+		leftHash:      node.leftHash,
+		leftNode:      node.leftNode,
+		rightHash:     node.rightHash,
+		rightNode:     node.rightNode,
+		persisted:     false,
 	}, nil
 }
 
 func (node *Node) isLeaf() bool {
-	return node.height == 0
+	return node.subtreeHeight == 0
 }
 
 // Check if the node has a descendant with the given key.
@@ -299,14 +298,14 @@ func (node *Node) validate() error {
 	if node.version <= 0 {
 		return errors.New("version must be greater than 0")
 	}
-	if node.height < 0 {
+	if node.subtreeHeight < 0 {
 		return errors.New("height cannot be less than 0")
 	}
 	if node.size < 1 {
 		return errors.New("size must be at least 1")
 	}
 
-	if node.height == 0 {
+	if node.subtreeHeight == 0 {
 		// Leaf nodes
 		if node.value == nil {
 			return errors.New("value cannot be nil for leaf node")
@@ -332,17 +331,17 @@ func (node *Node) validate() error {
 // Writes the node's hash to the given io.Writer. This function expects
 // child hashes to be already set.
 func (node *Node) writeHashBytes(w io.Writer) error {
-	err := encoding.EncodeVarint(w, int64(node.height))
+	err := encoding.EncodeVarint(w, int64(node.subtreeHeight))
 	if err != nil {
-		return errors.Wrap(err, "writing height")
+		return fmt.Errorf("writing height, %w", err)
 	}
 	err = encoding.EncodeVarint(w, node.size)
 	if err != nil {
-		return errors.Wrap(err, "writing size")
+		return fmt.Errorf("writing size, %w", err)
 	}
 	err = encoding.EncodeVarint(w, node.version)
 	if err != nil {
-		return errors.Wrap(err, "writing version")
+		return fmt.Errorf("writing version, %w", err)
 	}
 
 	// Key is not written for inner nodes, unlike writeBytes.
@@ -350,7 +349,7 @@ func (node *Node) writeHashBytes(w io.Writer) error {
 	if node.isLeaf() {
 		err = encoding.EncodeBytes(w, node.key)
 		if err != nil {
-			return errors.Wrap(err, "writing key")
+			return fmt.Errorf("writing key, %w", err)
 		}
 
 		// Indirection needed to provide proofs without values.
@@ -359,7 +358,7 @@ func (node *Node) writeHashBytes(w io.Writer) error {
 
 		err = encoding.EncodeBytes(w, valueHash[:])
 		if err != nil {
-			return errors.Wrap(err, "writing value")
+			return fmt.Errorf("writing value, %w", err)
 		}
 	} else {
 		if node.leftHash == nil || node.rightHash == nil {
@@ -367,11 +366,11 @@ func (node *Node) writeHashBytes(w io.Writer) error {
 		}
 		err = encoding.EncodeBytes(w, node.leftHash)
 		if err != nil {
-			return errors.Wrap(err, "writing left hash")
+			return fmt.Errorf("writing left hash, %w", err)
 		}
 		err = encoding.EncodeBytes(w, node.rightHash)
 		if err != nil {
-			return errors.Wrap(err, "writing right hash")
+			return fmt.Errorf("writing right hash, %w", err)
 		}
 	}
 
@@ -421,29 +420,29 @@ func (node *Node) writeBytes(w io.Writer) error {
 	if node == nil {
 		return errors.New("cannot write nil node")
 	}
-	cause := encoding.EncodeVarint(w, int64(node.height))
+	cause := encoding.EncodeVarint(w, int64(node.subtreeHeight))
 	if cause != nil {
-		return errors.Wrap(cause, "writing height")
+		return fmt.Errorf("writing height, %w", cause)
 	}
 	cause = encoding.EncodeVarint(w, node.size)
 	if cause != nil {
-		return errors.Wrap(cause, "writing size")
+		return fmt.Errorf("writing size, %w", cause)
 	}
 	cause = encoding.EncodeVarint(w, node.version)
 	if cause != nil {
-		return errors.Wrap(cause, "writing version")
+		return fmt.Errorf("writing version, %w", cause)
 	}
 
 	// Unlike writeHashBytes, key is written for inner nodes.
 	cause = encoding.EncodeBytes(w, node.key)
 	if cause != nil {
-		return errors.Wrap(cause, "writing key")
+		return fmt.Errorf("writing key, %w", cause)
 	}
 
 	if node.isLeaf() {
 		cause = encoding.EncodeBytes(w, node.value)
 		if cause != nil {
-			return errors.Wrap(cause, "writing value")
+			return fmt.Errorf("writing value, %w", cause)
 		}
 	} else {
 		if node.leftHash == nil {
@@ -451,7 +450,7 @@ func (node *Node) writeBytes(w io.Writer) error {
 		}
 		cause = encoding.EncodeBytes(w, node.leftHash)
 		if cause != nil {
-			return errors.Wrap(cause, "writing left hash")
+			return fmt.Errorf("writing left hash, %w", cause)
 		}
 
 		if node.rightHash == nil {
@@ -459,7 +458,7 @@ func (node *Node) writeBytes(w io.Writer) error {
 		}
 		cause = encoding.EncodeBytes(w, node.rightHash)
 		if cause != nil {
-			return errors.Wrap(cause, "writing right hash")
+			return fmt.Errorf("writing right hash, %w", cause)
 		}
 	}
 	return nil
@@ -501,7 +500,7 @@ func (node *Node) calcHeightAndSize(t *ImmutableTree) error {
 		return err
 	}
 
-	node.height = maxInt8(leftNode.height, rightNode.height) + 1
+	node.subtreeHeight = maxInt8(leftNode.subtreeHeight, rightNode.subtreeHeight) + 1
 	node.size = leftNode.size + rightNode.size
 	return nil
 }
@@ -517,7 +516,7 @@ func (node *Node) calcBalance(t *ImmutableTree) (int, error) {
 		return 0, err
 	}
 
-	return int(leftNode.height) - int(rightNode.height), nil
+	return int(leftNode.subtreeHeight) - int(rightNode.subtreeHeight), nil
 }
 
 // traverse is a wrapper over traverseInRange when we want the whole tree

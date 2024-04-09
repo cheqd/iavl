@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	dbm "github.com/tendermint/tm-db"
+	dbm "github.com/cometbft/cometbft-db"
 )
 
 // ImmutableTree contains the immutable tree at a given version. It is typically created by calling
@@ -45,7 +45,7 @@ func NewImmutableTreeWithOpts(db dbm.DB, cacheSize int, opts *Options, skipFastS
 // String returns a string representation of Tree.
 func (t *ImmutableTree) String() string {
 	leaves := []string{}
-	t.Iterate(func(key []byte, val []byte) (stop bool) {
+	t.Iterate(func(key []byte, val []byte) (stop bool) { //nolint:errcheck
 		leaves = append(leaves, fmt.Sprintf("%x: %x", key, val))
 		return false
 	})
@@ -67,7 +67,7 @@ func (t *ImmutableTree) RenderShape(indent string, encoder NodeEncoder) ([]strin
 type NodeEncoder func(id []byte, depth int, isLeaf bool) string
 
 // defaultNodeEncoder can encode any node unless the client overrides it
-func defaultNodeEncoder(id []byte, depth int, isLeaf bool) string {
+func defaultNodeEncoder(id []byte, _ int, isLeaf bool) string {
 	prefix := "- "
 	if isLeaf {
 		prefix = "* "
@@ -136,7 +136,7 @@ func (t *ImmutableTree) Height() int8 {
 	if t.root == nil {
 		return 0
 	}
-	return t.root.height
+	return t.root.subtreeHeight
 }
 
 // Has returns whether or not a key exists.
@@ -202,8 +202,8 @@ func (t *ImmutableTree) Get(key []byte) ([]byte, error) {
 			return result, err
 		}
 
-		if fastNode.versionLastUpdatedAt <= t.version {
-			return fastNode.value, nil
+		if fastNode.GetVersionLastUpdatedAt() <= t.version {
+			return fastNode.GetValue(), nil
 		}
 	}
 
@@ -231,15 +231,15 @@ func (t *ImmutableTree) Iterate(fn func(key []byte, value []byte) bool) (bool, e
 	}
 
 	itr, err := t.Iterator(nil, nil, true)
-	defer itr.Close()
 	if err != nil {
 		return false, err
 	}
+	defer itr.Close()
+
 	for ; itr.Valid(); itr.Next() {
 		if fn(itr.Key(), itr.Value()) {
 			return true, nil
 		}
-
 	}
 	return false, nil
 }
@@ -267,7 +267,7 @@ func (t *ImmutableTree) IterateRange(start, end []byte, ascending bool, fn func(
 		return false
 	}
 	return t.root.traverseInRange(t, start, end, ascending, false, false, func(node *Node) bool {
-		if node.height == 0 {
+		if node.subtreeHeight == 0 {
 			return fn(node.key, node.value)
 		}
 		return false
@@ -282,7 +282,7 @@ func (t *ImmutableTree) IterateRangeInclusive(start, end []byte, ascending bool,
 		return false
 	}
 	return t.root.traverseInRange(t, start, end, ascending, true, false, func(node *Node) bool {
-		if node.height == 0 {
+		if node.subtreeHeight == 0 {
 			return fn(node.key, node.value, node.version)
 		}
 		return false
@@ -322,7 +322,7 @@ func (t *ImmutableTree) clone() *ImmutableTree {
 
 // nodeSize is like Size, but includes inner nodes too.
 //
-//nolint:unused
+
 func (t *ImmutableTree) nodeSize() int {
 	size := 0
 	t.root.traverse(t, true, func(n *Node) bool {

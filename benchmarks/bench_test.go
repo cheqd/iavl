@@ -5,12 +5,13 @@ import (
 	"math/rand"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	db "github.com/cometbft/cometbft-db"
 	"github.com/cosmos/iavl"
-	db "github.com/tendermint/tm-db"
 )
 
 const historySize = 20
@@ -30,7 +31,8 @@ func prepareTree(b *testing.B, db db.DB, size, keyLen, dataLen int) (*iavl.Mutab
 
 	for i := 0; i < size; i++ {
 		key := randBytes(keyLen)
-		t.Set(key, randBytes(dataLen))
+		_, err = t.Set(key, randBytes(dataLen))
+		require.NoError(b, err)
 		keys[i] = key
 	}
 	commitTree(b, t)
@@ -40,10 +42,10 @@ func prepareTree(b *testing.B, db db.DB, size, keyLen, dataLen int) (*iavl.Mutab
 
 // commit tree saves a new version and deletes old ones according to historySize
 func commitTree(b *testing.B, t *iavl.MutableTree) {
-	t.Hash()
+	_, err := t.Hash()
+	require.NoError(b, err)
 
 	_, version, err := t.SaveVersion()
-
 	if err != nil {
 		b.Errorf("Can't save: %v", err)
 	}
@@ -63,7 +65,8 @@ func runQueriesFast(b *testing.B, t *iavl.MutableTree, keyLen int) {
 	require.True(b, isFastCacheEnabled)
 	for i := 0; i < b.N; i++ {
 		q := randBytes(keyLen)
-		t.Get(q)
+		_, err := t.Get(q)
+		require.NoError(b, err)
 	}
 }
 
@@ -75,7 +78,8 @@ func runKnownQueriesFast(b *testing.B, t *iavl.MutableTree, keys [][]byte) {
 	l := int32(len(keys))
 	for i := 0; i < b.N; i++ {
 		q := keys[rand.Int31n(l)]
-		t.Get(q)
+		_, err := t.Get(q)
+		require.NoError(b, err)
 	}
 }
 
@@ -95,7 +99,8 @@ func runQueriesSlow(b *testing.B, t *iavl.MutableTree, keyLen int) {
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
 		q := randBytes(keyLen)
-		itree.GetWithIndex(q)
+		_, _, err := itree.GetWithIndex(q)
+		require.NoError(b, err)
 	}
 }
 
@@ -152,7 +157,7 @@ func iterate(b *testing.B, itr db.Iterator, expectedSize int) {
 	b.StopTimer()
 	if g, w := len(keyValuePairs), expectedSize; g != w {
 		b.Errorf("iteration count mismatch: got=%d, want=%d", g, w)
-	} else {
+	} else if testing.Verbose() {
 		b.Logf("completed %d iterations", len(keyValuePairs))
 	}
 }
@@ -172,7 +177,8 @@ func runUpdate(b *testing.B, t *iavl.MutableTree, dataLen, blockSize int, keys [
 	l := int32(len(keys))
 	for i := 1; i <= b.N; i++ {
 		key := keys[rand.Int31n(l)]
-		t.Set(key, randBytes(dataLen))
+		_, err := t.Set(key, randBytes(dataLen))
+		require.NoError(b, err)
 		if i%blockSize == 0 {
 			commitTree(b, t)
 		}
@@ -219,8 +225,10 @@ func runBlock(b *testing.B, t *iavl.MutableTree, keyLen, dataLen, blockSize int,
 			// perform query and write on check and then real
 			// check.GetFast(key)
 			// check.Set(key, data)
-			real.Get(key)
-			real.Set(key, data)
+			_, err := real.Get(key)
+			require.NoError(b, err)
+			_, err = real.Set(key, data)
+			require.NoError(b, err)
 		}
 
 		// at the end of a block, move it all along....
@@ -260,11 +268,9 @@ func BenchmarkMedium(b *testing.B) {
 	benchmarks := []benchmark{
 		{"memdb", 100000, 100, 16, 40},
 		{"goleveldb", 100000, 100, 16, 40},
-		// {"cleveldb", 100000, 100, 16, 40},
-		// FIXME: idk why boltdb is too slow !?
-		// {"boltdb", 100000, 100, 16, 40},
-		// {"rocksdb", 100000, 100, 16, 40},
-		// {"badgerdb", 100000, 100, 16, 40},
+		{"cleveldb", 100000, 100, 16, 40},
+		{"rocksdb", 100000, 100, 16, 40},
+		{"pebbledb", 100000, 100, 16, 40},
 	}
 	runBenchmarks(b, benchmarks)
 }
@@ -273,10 +279,9 @@ func BenchmarkSmall(b *testing.B) {
 	benchmarks := []benchmark{
 		{"memdb", 1000, 100, 4, 10},
 		{"goleveldb", 1000, 100, 4, 10},
-		// {"cleveldb", 1000, 100, 4, 10},
-		// {"boltdb", 1000, 100, 4, 10},
-		// {"rocksdb", 1000, 100, 4, 10},
-		// {"badgerdb", 1000, 100, 4, 10},
+		{"cleveldb", 1000, 100, 4, 10},
+		{"rocksdb", 1000, 100, 4, 10},
+		{"pebbledb", 1000, 100, 4, 10},
 	}
 	runBenchmarks(b, benchmarks)
 }
@@ -325,8 +330,8 @@ func runBenchmarks(b *testing.B, benchmarks []benchmark) {
 
 		// prepare a dir for the db and cleanup afterwards
 		dirName := fmt.Sprintf("./%s-db", prefix)
-		if (bb.dbType == db.RocksDBBackend) || (bb.dbType == db.CLevelDBBackend) || (bb.dbType == db.BoltDBBackend) {
-			_ = os.Mkdir(dirName, 0755)
+		if (bb.dbType == db.RocksDBBackend) || (bb.dbType == db.CLevelDBBackend) {
+			_ = os.Mkdir(dirName, 0o755)
 		}
 
 		defer func() {
@@ -343,7 +348,18 @@ func runBenchmarks(b *testing.B, benchmarks []benchmark) {
 		)
 		if bb.dbType != "nodb" {
 			d, err = db.NewDB("test", bb.dbType, dirName)
-			require.NoError(b, err)
+
+			if err != nil {
+				if strings.Contains(err.Error(), "unknown db_backend") {
+					// As an exception to run benchmarks: if the error is about cleveldb, or rocksdb,
+					// it requires a tag "cleveldb" to link the database at runtime, so instead just
+					// log the error instead of failing.
+					b.Logf("%+v\n", err)
+					continue
+				} else {
+					require.NoError(b, err)
+				}
+			}
 			defer d.Close()
 		}
 		b.Run(prefix, func(sub *testing.B) {

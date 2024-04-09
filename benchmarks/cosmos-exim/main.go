@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"time"
 
+	tmdb "github.com/cometbft/cometbft-db"
 	"github.com/cosmos/iavl"
-	tmdb "github.com/tendermint/tm-db"
 )
 
 // stores is the list of stores in the CosmosHub database
@@ -135,7 +134,7 @@ func runExport(dbPath string) (int64, map[string][]*iavl.ExportNode, error) {
 		defer exporter.Close()
 		for {
 			node, err := exporter.Next()
-			if err == iavl.ExportDone {
+			if err == iavl.ErrorExportDone {
 				break
 			} else if err != nil {
 				return 0, nil, err
@@ -161,7 +160,7 @@ func runImport(version int64, exports map[string][]*iavl.ExportNode) error {
 	totalStats := Stats{}
 
 	for _, name := range stores {
-		tempdir, err := ioutil.TempDir("", name)
+		tempdir, err := os.MkdirTemp("", name)
 		if err != nil {
 			return err
 		}

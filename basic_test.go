@@ -8,9 +8,10 @@ import (
 	"sort"
 	"testing"
 
+	db "github.com/cometbft/cometbft-db"
+	iavlrand "github.com/cosmos/iavl/internal/rand"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	db "github.com/tendermint/tm-db"
 )
 
 func TestBasic(t *testing.T) {
@@ -54,7 +55,7 @@ func TestBasic(t *testing.T) {
 			t.Errorf("Unexpected value %s", val)
 		}
 
-		val, err = tree.Get(key)
+		val, _ = tree.Get(key)
 		if val != nil {
 			t.Error("Fast method - expected no value to exist")
 		}
@@ -107,7 +108,7 @@ func TestBasic(t *testing.T) {
 			t.Errorf("Unexpected value %s", val)
 		}
 
-		val, err = tree.Get(key)
+		val, _ = tree.Get(key)
 		if val == nil {
 			t.Error("Fast method - expected value to exist")
 		}
@@ -133,7 +134,7 @@ func TestBasic(t *testing.T) {
 			t.Errorf("Unexpected value %s", val)
 		}
 
-		val, err = tree.Get(key)
+		val, _ = tree.Get(key)
 		if val != nil {
 			t.Error("Fast method - expected no value to exist")
 		}
@@ -159,7 +160,7 @@ func TestBasic(t *testing.T) {
 			t.Errorf("Unexpected value %s", val)
 		}
 
-		val, err = tree.Get(key)
+		val, _ = tree.Get(key)
 		if val != nil {
 			t.Error("Fast method - expected no value to exist")
 		}
@@ -170,7 +171,6 @@ func TestBasic(t *testing.T) {
 }
 
 func TestUnit(t *testing.T) {
-
 	expectHash := func(tree *ImmutableTree, hashCount int64) {
 		// ensure number of new hash calculations is as expected.
 		hash, count, err := tree.root.hashWithCount()
@@ -259,7 +259,6 @@ func TestUnit(t *testing.T) {
 	require.NoError(t, err)
 	expectRemove(t11, 4, "((1 2) (3 5))", 2)
 	expectRemove(t11, 3, "((1 2) (4 5))", 1)
-
 }
 
 func TestRemove(t *testing.T) {
@@ -273,8 +272,8 @@ func TestRemove(t *testing.T) {
 	keys := make([][]byte, size)
 	l := int32(len(keys))
 	for i := 0; i < size; i++ {
-		key := randBytes(keyLen)
-		t1.Set(key, randBytes(dataLen))
+		key := iavlrand.RandBytes(keyLen)
+		t1.Set(key, iavlrand.RandBytes(dataLen))
 		keys[i] = key
 	}
 
@@ -290,7 +289,6 @@ func TestRemove(t *testing.T) {
 }
 
 func TestIntegration(t *testing.T) {
-
 	type record struct {
 		key   string
 		value string
@@ -493,7 +491,6 @@ func TestPersistence(t *testing.T) {
 }
 
 func TestProof(t *testing.T) {
-
 	// Construct some random tree
 	tree, err := getTestTree(100)
 	require.NoError(t, err)
@@ -513,13 +510,17 @@ func TestProof(t *testing.T) {
 
 	// Now for each item, construct a proof and verify
 	tree.Iterate(func(key []byte, value []byte) bool {
-		value2, proof, err := tree.GetWithProof(key)
+		proof, err := tree.GetMembershipProof(key)
 		assert.NoError(t, err)
-		assert.Equal(t, value, value2)
-		if assert.NotNil(t, proof) {
-			hash, err := tree.WorkingHash()
-			require.NoError(t, err)
-			verifyProof(t, proof, hash)
+		assert.Equal(t, value, proof.GetExist().Value)
+		res, err := tree.VerifyMembership(proof, key)
+		assert.NoError(t, err)
+		value2, err := tree.ImmutableTree.Get(key)
+		assert.NoError(t, err)
+		if value2 != nil {
+			assert.True(t, res)
+		} else {
+			assert.False(t, res)
 		}
 		return false
 	})
@@ -534,11 +535,8 @@ func TestTreeProof(t *testing.T) {
 	assert.Equal(t, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", hex.EncodeToString(hash))
 
 	// should get false for proof with nil root
-	value, proof, err := tree.GetWithProof([]byte("foo"))
-	assert.Nil(t, value)
-	assert.Nil(t, proof)
-	assert.Error(t, proof.Verify([]byte(nil)))
-	assert.NoError(t, err)
+	_, err = tree.GetProof([]byte("foo"))
+	require.Error(t, err)
 
 	// insert lots of info and store the bytes
 	keys := make([][]byte, 200)
@@ -551,27 +549,18 @@ func TestTreeProof(t *testing.T) {
 	tree.SaveVersion()
 
 	// query random key fails
-	value, proof, err = tree.GetWithProof([]byte("foo"))
-	assert.Nil(t, value)
-	assert.NotNil(t, proof)
-	assert.NoError(t, err)
-	hash, err = tree.Hash()
-	assert.NoError(t, err)
-	assert.NoError(t, proof.Verify(hash))
-	assert.NoError(t, proof.VerifyAbsence([]byte("foo")))
+	_, err = tree.GetMembershipProof([]byte("foo"))
+	assert.Error(t, err)
 
 	// valid proof for real keys
-	root, err := tree.WorkingHash()
-	assert.NoError(t, err)
 	for _, key := range keys {
-		value, proof, err := tree.GetWithProof(key)
+		proof, err := tree.GetMembershipProof(key)
 		if assert.NoError(t, err) {
 			require.Nil(t, err, "Failed to read proof from bytes: %v", err)
-			assert.Equal(t, key, value)
-			err := proof.Verify(root)
-			assert.NoError(t, err, "#### %v", proof.String())
-			err = proof.VerifyItem(key, key)
-			assert.NoError(t, err, "#### %v", proof.String())
+			assert.Equal(t, key, proof.GetExist().Value)
+			res, err := tree.VerifyMembership(proof, key)
+			require.NoError(t, err)
+			require.True(t, res)
 		}
 	}
 }
