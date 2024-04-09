@@ -1,6 +1,7 @@
 package iavl
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,9 +14,6 @@ const exportBufferSize = 32
 
 // ErrorExportDone is returned by Exporter.Next() when all items have been exported.
 var ErrorExportDone = errors.New("export is complete")
-
-// ErrNotInitalizedTree when chains introduce a store without initializing data
-var ErrNotInitalizedTree = errors.New("iavl/export newExporter failed to create")
 
 // ErrNotInitalizedTree when chains introduce a store without initializing data
 var ErrNotInitalizedTree = errors.New("iavl/export newExporter failed to create")
@@ -34,13 +32,24 @@ type ExportNode struct {
 // depth-first post-order (LRN), this order must be preserved when importing in order to recreate
 // the same tree structure.
 type Exporter struct {
-	tree   *ImmutableTree
-	ch     chan *ExportNode
-	cancel context.CancelFunc
+	tree       *ImmutableTree
+	ch         chan *ExportNode
+	cancel     context.CancelFunc
+	optimistic bool // export raw key value pairs for optimistic import
 }
 
 // NewExporter creates a new Exporter. Callers must call Close() when done.
 func newExporter(tree *ImmutableTree) (*Exporter, error) {
+	return newExporterWithOptions(tree, false)
+}
+
+// NewOptimisticExporter creates a new Exporter with raw Key Values. Callers must call Close() when done.
+func newOptimisticExporter(tree *ImmutableTree) (*Exporter, error) {
+	return newExporterWithOptions(tree, true)
+}
+
+// NewExporterWithOptions creates a new Exporter and configures optimistic mode
+func newExporterWithOptions(tree *ImmutableTree, optimistic bool) (*Exporter, error) {
 	if tree == nil {
 		return nil, fmt.Errorf("tree is nil: %w", ErrNotInitalizedTree)
 	}
@@ -51,25 +60,25 @@ func newExporter(tree *ImmutableTree) (*Exporter, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	exporter := &Exporter{
-		tree:   tree,
-		ch:     make(chan *ExportNode, exportBufferSize),
-		cancel: cancel,
+		tree:       tree,
+		ch:         make(chan *ExportNode, exportBufferSize),
+		cancel:     cancel,
+		optimistic: optimistic,
 	}
 
-	// CV Prevent crash on incrVersionReaders if tree.ndb == nil (happens when  ree.root = nil)
-	if tree.ndb != nil {
-		tree.ndb.incrVersionReaders(tree.version)
+	tree.ndb.incrVersionReaders(tree.version)
+	if exporter.optimistic {
+		go exporter.optimisticExport(ctx)
 	} else {
-		fmt.Printf("WARNING iavl/export Skipping Version lock for out of sync tree\n")
+		go exporter.export(ctx)
 	}
-	go exporter.export(ctx)
 
 	return exporter, nil
 }
 
 // export exports nodes
 func (e *Exporter) export(ctx context.Context) {
-	e.tree.root.traversePost(e.tree, true, func(node *Node) bool {
+	_ = e.tree.root.traversePost(e.tree, true, func(node *Node) bool {
 		exportNode := &ExportNode{
 			Key:     node.key,
 			Value:   node.value,
@@ -87,6 +96,54 @@ func (e *Exporter) export(ctx context.Context) {
 	close(e.ch)
 }
 
+// optimisticExport exports raw key, value nodes
+// Cosmos-SDK should set different snapshot format so nodes can select between either "untrusted statesync" or "trusted-peer optimistic" import
+func (e *Exporter) optimisticExport(ctx context.Context) {
+	rootKeyBytes := e.tree.ndb.rootKey(e.tree.version)
+	rootValueBytes, err := e.tree.ndb.db.Get(rootKeyBytes)
+	if err != nil {
+		fmt.Printf("ERROR: failed get get rootNode\n")
+	}
+	exportNode := &ExportNode{
+		Key:     rootKeyBytes,
+		Value:   rootValueBytes,
+		Version: 0, // Version not used
+		Height:  0, // Height not used
+	}
+	e.ch <- exportNode
+
+	e.tree.root.traverse(e.tree, true, func(node *Node) bool {
+		// TODO: How to get the original db value bytes directly without writeBytes()?
+		buf := bufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufPool.Put(buf)
+
+		if err := node.writeBytes(buf); err != nil {
+			fmt.Printf("WARN: failed writeBytes")
+		}
+
+		bytesCopy := make([]byte, buf.Len())
+		copy(bytesCopy, buf.Bytes())
+
+		// Use Export Node Format.
+		exportNode := &ExportNode{
+			Key:     e.tree.ndb.nodeKey(node.hash), // TODO: How to get prefixed key so that import does not need to prefix?
+			Value:   bytesCopy,
+			Version: 0, // Version not used
+			Height:  0, // Height not used
+		}
+
+		select {
+		case e.ch <- exportNode:
+			return false
+		case <-ctx.Done():
+			return true
+		}
+	})
+
+	close(e.ch)
+}
+
 // Next fetches the next exported node, or returns ExportDone when done.
 func (e *Exporter) Next() (*ExportNode, error) {
 	if exportNode, ok := <-e.ch; ok {
@@ -100,7 +157,7 @@ func (e *Exporter) Close() {
 	e.cancel()
 	for range e.ch { // drain channel
 	}
-	if e.tree != nil && e.tree.ndb != nil {
+	if e.tree != nil {
 		e.tree.ndb.decrVersionReaders(e.tree.version)
 	}
 	e.tree = nil
