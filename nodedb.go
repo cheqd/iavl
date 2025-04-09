@@ -585,7 +585,6 @@ func (ndb *nodeDB) DeleteVersionsFrom(fromVersion int64) error {
 	err = ndb.traverseRange(nodeKeyPrefixFormat.KeyInt64(fromVersion), nodeKeyPrefixFormat.KeyInt64(latest+1), func(k, v []byte) error {
 		return ndb.batch.Delete(k)
 	})
-
 	if err != nil {
 		return err
 	}
@@ -664,7 +663,10 @@ func (ndb *nodeDB) deleteVersionsTo(toVersion int64) error {
 	}
 
 	if latest <= toVersion {
-		return fmt.Errorf("latest version %d is less than or equal to toVersion %d", latest, toVersion)
+		toVersion = latest - 10
+		if toVersion < 0 {
+			return nil
+		}
 	}
 
 	ndb.mtx.Lock()
@@ -1332,7 +1334,6 @@ func (ndb *nodeDB) String() (string, error) {
 		index++
 		return nil
 	})
-
 	if err != nil {
 		return "", err
 	}
