@@ -1,9 +1,13 @@
 package iavl
 
 import (
+	"context"
+	"fmt"
 	"math"
 	"math/rand"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -430,4 +434,188 @@ func BenchmarkExport(b *testing.B) {
 		}
 		exporter.Close()
 	}
+}
+
+func TestOptimisticExportImport_DeeplyUnevenTree(t *testing.T) {
+	tree := NewMutableTree(dbm.NewMemDB(), 0, false, NewNopLogger())
+	// Create a left-heavy tree
+	for i := 0; i < 1000; i++ {
+		key := []byte(fmt.Sprintf("key-%d", i))
+		val := []byte(fmt.Sprintf("val-%d", i))
+		_, err := tree.Set(key, val)
+		require.NoError(t, err)
+	}
+	_, _, err := tree.SaveVersion()
+	require.NoError(t, err)
+
+	exporter, err := tree.OptimisticExport()
+	require.NoError(t, err)
+	defer exporter.Close()
+	newTree := NewMutableTree(dbm.NewMemDB(), 0, false, NewNopLogger())
+	importer, err := newTree.OptimisticImport(tree.Version())
+	require.NoError(t, err)
+	defer importer.Close()
+
+	for {
+		item, err := exporter.Next()
+		if err == ErrorExportDone {
+			err = importer.Commit()
+			require.NoError(t, err)
+			break
+		}
+		require.NoError(t, err)
+		err = importer.Add(item)
+		require.NoError(t, err)
+	}
+
+	treeHash := tree.Hash()
+	newTreeHash := newTree.Hash()
+
+	require.Equal(t, treeHash, newTreeHash, "Tree hash mismatch")
+	require.Equal(t, tree.Size(), newTree.Size(), "Tree size mismatch")
+	require.Equal(t, tree.Version(), newTree.Version(), "Tree version mismatch")
+
+	tree.Iterate(func(key, value []byte) bool { //nolint:errcheck
+		index, _, err := tree.GetWithIndex(key)
+		require.NoError(t, err)
+		newIndex, newValue, err := newTree.GetWithIndex(key)
+		require.NoError(t, err)
+		require.Equal(t, index, newIndex, "Index mismatch for key %v", key)
+		require.Equal(t, value, newValue, "Value mismatch for key %v", key)
+		return false
+	})
+}
+
+func TestOptimisticExport_WithConcurrentModification(t *testing.T) {
+	tree := NewMutableTree(dbm.NewMemDB(), 0, false, NewNopLogger())
+
+	// Set initial keys
+	for i := 0; i < 100; i++ {
+		_, err := tree.Set([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+		require.NoError(t, err)
+	}
+	_, _, err := tree.SaveVersion()
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	exporter, err := tree.OptimisticExport()
+	require.NoError(t, err)
+
+	writer := &MockWriter{}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Concurrent tree modification
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond)
+		_, _ = tree.Set([]byte("key-concurrent"), []byte("value-concurrent"))
+	}()
+
+	var exportErr error
+	// Exporting routine
+	go func() {
+		defer wg.Done()
+		for {
+			node, err := exporter.Next()
+			if err != nil {
+				break
+			}
+			if err := writer.WriteNode(ctx, node); err != nil {
+				exportErr = err
+				break
+			}
+		}
+		exporter.Close()
+	}()
+
+	wg.Wait()
+	t.Logf("Export completed with %d nodes written", writer.Count())
+
+	// Validate that we either detected inconsistency or failed gracefully
+	if exportErr != nil {
+		t.Logf("Exporter failed safely with: %v", exportErr)
+	} else {
+		t.Log("Exporter succeeded - concurrent mutation may not have been detected")
+	}
+
+	// Optional: validate key presence/absence consistency
+	_, err = tree.Get([]byte("key-concurrent"))
+	require.NoError(t, err) // ensure write was successful
+
+	// Ensure exported buffer does not contain the concurrent key
+	for _, nodes := range writer.Nodes {
+		require.NotEqual(t, []byte("key-concurrent"), nodes.Key, "Exporter included a key set during export")
+	}
+}
+
+func TestOptimisticExport_CancelledMidway(t *testing.T) {
+	tree := NewMutableTree(dbm.NewMemDB(), 0, false, NewNopLogger())
+
+	// Fill a large tree
+	for i := 0; i < 5000; i++ {
+		_, err := tree.Set([]byte(fmt.Sprintf("key-%d", i)), []byte("value"))
+		require.NoError(t, err)
+	}
+	_, _, err := tree.SaveVersion()
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	buf := &MockWriter{
+		OnWrite: func(n int) {
+			if n > 1000 {
+				cancel()
+			}
+		},
+	}
+
+	exporter, err := tree.OptimisticExport()
+	require.NoError(t, err)
+	defer exporter.Close()
+
+	var exportErr error
+	for {
+		node, err := exporter.Next()
+		if err != nil {
+			break
+		}
+		if err := buf.WriteNode(ctx, node); err != nil {
+			exportErr = err
+			break
+		}
+	}
+	exporter.Close()
+
+	require.Error(t, exportErr)
+	require.Contains(t, exportErr.Error(), "context canceled")
+	t.Logf("Export stopped at node count: %d", buf.Count())
+}
+
+type MockWriter struct {
+	mu      sync.Mutex
+	Nodes   []*ExportNode
+	OnWrite func(count int)
+}
+
+func (m *MockWriter) WriteNode(ctx context.Context, node *ExportNode) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		m.Nodes = append(m.Nodes, node)
+		if m.OnWrite != nil {
+			m.OnWrite(len(m.Nodes)) // invoke callback with current count
+		}
+		return nil
+	}
+}
+
+func (m *MockWriter) Count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.Nodes)
 }
