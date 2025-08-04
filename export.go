@@ -53,10 +53,6 @@ func newExporterWithOptions(tree *ImmutableTree, optimistic bool) (*Exporter, er
 	if tree == nil {
 		return nil, fmt.Errorf("tree is nil: %w", ErrNotInitalizedTree)
 	}
-	// CV Prevent crash on incrVersionReaders if tree.ndb == nil
-	if tree.ndb == nil {
-		return nil, fmt.Errorf("tree.ndb is nil: %w", ErrNotInitalizedTree)
-	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	exporter := &Exporter{
@@ -66,7 +62,13 @@ func newExporterWithOptions(tree *ImmutableTree, optimistic bool) (*Exporter, er
 		optimistic: optimistic,
 	}
 
-	tree.ndb.incrVersionReaders(tree.version)
+	// CV Prevent crash on incrVersionReaders if tree.ndb == nil (happens when ree.root = nil)
+	if tree.ndb != nil {
+		tree.ndb.incrVersionReaders(tree.version)
+	} else {
+		fmt.Printf("WARNING iavl/export Skipping Version lock for out of sync tree\n")
+	}
+
 	if exporter.optimistic {
 		go exporter.optimisticExport(ctx)
 	} else {
@@ -157,7 +159,7 @@ func (e *Exporter) Close() {
 	e.cancel()
 	for range e.ch { //nolint:revive
 	} // drain channel
-	if e.tree != nil {
+	if e.tree != nil && e.tree.ndb != nil {
 		e.tree.ndb.decrVersionReaders(e.tree.version)
 	}
 	e.tree = nil
