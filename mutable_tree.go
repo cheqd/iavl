@@ -151,6 +151,10 @@ func (tree *MutableTree) WorkingVersion() int64 {
 	return version
 }
 
+func (tree *MutableTree) SetVersion(version int64) {
+	tree.version = version
+}
+
 // String returns a string representation of the tree.
 func (tree *MutableTree) String() (string, error) {
 	return tree.ndb.String()
